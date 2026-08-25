@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+from openwakeword.model import Model as WakeWordModel
+import openwakeword.utils as oww_utils
+
 
 # ============================================================
 # WHAT'S DIFFERENT ABOUT THIS VERSION
@@ -36,6 +39,21 @@ from google.genai import types
 #     chunk arrives, not after the full reply is generated.
 #     This is the "streams almost instantaneously" behavior.
 #
+# This version also replaces "press ENTER to talk" with a
+# wake word: say "hey Jarvis" (or "Jarvis") and it activates
+# on its own. This uses openWakeWord, which is free, fully
+# offline, and ships a pretrained "hey jarvis" model — no
+# training or API key needed for this part.
+#
+# The mic runs continuously. A single audio callback pushes
+# raw frames into a queue. A state machine decides what to do
+# with each frame:
+#   - LISTENING state: frames go to the wake word model.
+#   - ACTIVE state: frames get streamed to the Gemini Live
+#     session instead.
+# Saying the wake word flips LISTENING -> ACTIVE. Gemini
+# reporting turn_complete flips ACTIVE -> LISTENING.
+#
 # Tradeoffs / things to verify on your machine, since I
 # can't run audio hardware from here:
 #   - Voice, sample rates, and exact model name availability
@@ -46,10 +64,20 @@ from google.genai import types
 #     sessions varies by model version; it's included below
 #     but wrapped so the script still runs if your model
 #     rejects it.
-#   - Personality/behavior is now steered by system_instruction
-#     same as before, but responses are spoken directly by
-#     Gemini's own TTS voice, not Piper. Voice name is
-#     configurable below.
+#   - openWakeWord's "hey jarvis" model may also fire on just
+#     "Jarvis" but with a higher false-reject rate — say "hey
+#     Jarvis" for the most reliable trigger.
+#   - The wake word listener is paused while Jarvis is
+#     speaking, since openWakeWord's own docs note that
+#     simultaneous playback increases false detections
+#     without echo cancellation. This means you currently
+#     can't barge in with the wake word mid-response — you
+#     have to wait for Jarvis to finish before saying it
+#     again. Flag if you want barge-in and we can look at
+#     adding acoustic echo cancellation.
+#   - WAKE_THRESHOLD below controls sensitivity. Lower catches
+#     more (but more false positives), higher requires a
+#     clearer utterance.
 # ============================================================
 
 
@@ -87,8 +115,25 @@ CHUNK_MS = 20
 CHUNK_SAMPLES = int(INPUT_SAMPLE_RATE * CHUNK_MS / 1000)
 
 
+# ============================================================
+# Wake word configuration
+# ============================================================
+
+WAKE_WORD_NAME = "hey_jarvis"
+
+# Score threshold (0-1) needed to trigger activation.
+# openWakeWord's own default guidance is 0.5 for most cases.
+WAKE_THRESHOLD = 0.5
+
+# openWakeWord's models expect 16kHz mono int16 audio in
+# frames of this many samples (80ms).
+WAKE_FRAME_SAMPLES = 1280
+
+
 SYSTEM_PROMPT = """
-You are Jarvis, a personal voice assistant. You are sarcastic, opinionated, and witty. You are assistant to Siddhi. 
+You are Jarvis, a personal voice assistant. You are sarcastic, opinionated, and witty, in the dry British sense. You are assistant to Siddhi.
+
+Speak in British English: British vocabulary and spelling conventions (e.g. "brilliant", "rubbish", "quite"), not American ones.
 
 Be concise, natural, intelligent, and conversational.
 
@@ -129,7 +174,7 @@ def build_config():
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(
                     voice_name=VOICE_NAME
                 )
-            )
+            ),
         ),
         # Ask the API to also give us text transcripts of both
         # sides, purely so we can print "You:" / "Jarvis:" like
@@ -156,11 +201,66 @@ def build_config():
 
 
 # ============================================================
-# Microphone capture
+# Wake word listener
+#
+# Wraps openWakeWord. Downloads the pretrained models on first
+# run (openWakeWord handles caching itself).
+# ============================================================
+
+class WakeWordListener:
+
+    def __init__(self):
+
+        # Ensures the pretrained model files are present.
+        oww_utils.download_models()
+
+        self._model = WakeWordModel(
+            wakeword_models=[WAKE_WORD_NAME]
+        )
+
+        self._buffer = np.array([], dtype=np.int16)
+
+    def feed(self, pcm_bytes):
+        """
+        Feed raw int16 PCM bytes in. Returns True the moment
+        the wake word score crosses threshold.
+        """
+
+        new_samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+
+        self._buffer = np.concatenate([self._buffer, new_samples])
+
+        triggered = False
+
+        while len(self._buffer) >= WAKE_FRAME_SAMPLES:
+
+            frame = self._buffer[:WAKE_FRAME_SAMPLES]
+            self._buffer = self._buffer[WAKE_FRAME_SAMPLES:]
+
+            predictions = self._model.predict(frame)
+
+            score = predictions.get(WAKE_WORD_NAME, 0.0)
+
+            if score >= WAKE_THRESHOLD:
+                triggered = True
+
+        return triggered
+
+    def reset(self):
+
+        # Clears internal model buffers so leftover audio
+        # doesn't cause an immediate re-trigger next time we
+        # start listening again.
+        self._model.reset()
+        self._buffer = np.array([], dtype=np.int16)
+
+
+# ============================================================
+# Continuous microphone capture
 #
 # sounddevice runs its callback on a separate audio thread.
-# We push raw PCM16 bytes into a plain thread-safe queue.Queue,
-# and a small async task drains it into the Live session.
+# We push raw PCM16 bytes into a plain thread-safe queue.Queue
+# that the main asyncio loop drains.
 # ============================================================
 
 class MicStreamer:
@@ -196,11 +296,9 @@ class MicStreamer:
             self._stream.close()
             self._stream = None
 
-        # Drain anything left in the queue.
-        while not self._q.empty():
-            self._q.get_nowait()
+        self.drain()
 
-    def get_nowait_all(self):
+    def drain(self):
 
         chunks = []
 
@@ -208,6 +306,21 @@ class MicStreamer:
             chunks.append(self._q.get_nowait())
 
         return chunks
+
+    async def get_async(self, timeout=0.1):
+        """
+        Blocks (off the event loop) for up to `timeout` seconds
+        waiting for the next chunk. Returns None on timeout.
+        """
+
+        loop = asyncio.get_event_loop()
+
+        try:
+            return await loop.run_in_executor(
+                None, self._q.get, True, timeout
+            )
+        except queue.Empty:
+            return None
 
 
 # ============================================================
@@ -253,21 +366,19 @@ class SpeakerPlayer:
 # ============================================================
 # One conversational turn
 #
-# Streams mic audio to the session until the API's own VAD
-# reports the turn is complete, then plays back the streamed
-# audio response as it arrives.
+# Called once the wake word has already fired. Streams mic
+# audio to the session until the API's own VAD reports the
+# turn is complete, then plays back the streamed audio
+# response as it arrives.
 # ============================================================
 
-async def run_turn(session):
+async def run_turn(session, mic):
 
-    mic = MicStreamer()
     speaker = SpeakerPlayer()
-
-    mic.start()
 
     turn_start = time.time()
 
-    print("\nListening... (speak now, Jarvis will detect when you stop)")
+    print("Yes? Listening...")
 
     user_text_parts = []
     model_text_parts = []
@@ -280,26 +391,23 @@ async def run_turn(session):
 
             while not stop_sending.is_set():
 
-                chunks = mic.get_nowait_all()
+                chunk = await mic.get_async(timeout=0.05)
 
-                for chunk in chunks:
+                if chunk is None:
+                    continue
 
-                    await session.send_realtime_input(
-                        audio=types.Blob(
-                            data=chunk,
-                            mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}",
-                        )
+                await session.send_realtime_input(
+                    audio=types.Blob(
+                        data=chunk,
+                        mime_type=f"audio/pcm;rate={INPUT_SAMPLE_RATE}",
                     )
-
-                await asyncio.sleep(0.01)
+                )
 
         except Exception as error:
 
             print(f"[sender error] {error}", file=sys.stderr)
 
     async def receiver():
-
-        turn_complete = False
 
         try:
 
@@ -313,8 +421,6 @@ async def run_turn(session):
                     continue
 
                 if getattr(server_content, "interrupted", False):
-                    # User started talking again while Jarvis was
-                    # speaking. Stop playback for this turn.
                     break
 
                 input_transcription = getattr(
@@ -343,7 +449,6 @@ async def run_turn(session):
                             speaker.write(inline.data)
 
                 if getattr(server_content, "turn_complete", False):
-                    turn_complete = True
                     break
 
         except Exception as error:
@@ -354,15 +459,12 @@ async def run_turn(session):
 
             stop_sending.set()
 
-        return turn_complete
-
     sender_task = asyncio.create_task(sender())
     receiver_task = asyncio.create_task(receiver())
 
     await receiver_task
     await sender_task
 
-    mic.stop()
     speaker.close()
 
     ttfa = speaker.time_to_first_audio(turn_start)
@@ -384,6 +486,11 @@ async def run_turn(session):
 
 # ============================================================
 # Main loop
+#
+# Runs continuously. Feeds mic audio to the wake word listener
+# until "hey Jarvis" is detected, then hands control over to
+# run_turn() for that conversational exchange, then goes back
+# to listening for the wake word.
 # ============================================================
 
 async def main():
@@ -395,43 +502,63 @@ async def main():
     print()
     print("Model:", MODEL_NAME)
     print("Voice:", VOICE_NAME)
-    print("Press ENTER to speak, Ctrl+C to quit.")
+    print('Say "hey Jarvis" to activate. Ctrl+C to quit.')
     print()
 
     config = build_config()
+    wake_word = WakeWordListener()
+    mic = MicStreamer()
+
+    mic.start()
 
     async with client.aio.live.connect(
         model=MODEL_NAME, config=config
     ) as session:
 
-        loop = asyncio.get_event_loop()
+        try:
 
-        while True:
+            while True:
 
-            try:
+                chunk = await mic.get_async(timeout=0.1)
 
-                await loop.run_in_executor(None, input, "> ")
+                if chunk is None:
+                    continue
 
-            except (EOFError, KeyboardInterrupt):
+                if wake_word.feed(chunk):
 
-                print("\nJarvis shutting down.")
-                break
+                    print('\n"Hey Jarvis" detected.')
 
-            try:
+                    # Drop anything queued during the wake
+                    # phrase itself so it isn't replayed into
+                    # the turn as leftover audio.
+                    mic.drain()
 
-                user_text = await run_turn(session)
+                    try:
+                        user_text = await run_turn(session, mic)
+                    except Exception as error:
+                        print()
+                        print("ERROR:")
+                        print(error)
+                        print()
+                        user_text = ""
 
-                if user_text.lower().strip() in {
-                    "quit", "exit", "shutdown", "goodbye"
-                }:
-                    break
+                    if user_text.lower().strip() in {
+                        "quit", "exit", "shutdown", "goodbye"
+                    }:
+                        break
 
-            except Exception as error:
+                    wake_word.reset()
 
-                print()
-                print("ERROR:")
-                print(error)
-                print()
+                    print('\nSay "hey Jarvis" to activate. Ctrl+C to quit.')
+
+        except (EOFError, KeyboardInterrupt):
+
+            pass
+
+        finally:
+
+            mic.stop()
+            print("\nJarvis shutting down.")
 
 
 if __name__ == "__main__":
